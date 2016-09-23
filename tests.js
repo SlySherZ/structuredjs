@@ -1963,6 +1963,43 @@ var commutativity = function(){
     });
 };
 
+var newTests = function(){
+    QUnit.module("Fixes to structuredJS bugs.");
+
+    test("--", function() {
+        structure = function() {
+			var $t = _;
+
+			draw = function() {
+				// You can add whatever code you want here, it still passes
+				var s = "My cat is fluffy";
+			};
+        };
+        code = "\n\
+		for (var x = 0; x < 1; x++) { \n\
+			var a = 0;	\n\
+		}	\n\
+		var draw = function() {};"; 
+        equal(Structured.match(code, structure), false, "GIT issue #24");
+
+        structure = function() {
+			fill(_);
+			if ($ifCond) {
+				fill(_);
+			} 
+			rect(_);
+        };
+        code = "\n\
+		if (mouseIsPressed) {	\n\
+			fill(255, 0, 0);	\n\
+		}						\n\
+		fill(0, 255, 68);		\n\
+		rect(0, 0, 400, 200);"; 
+        equal(Structured.match(code, structure), false, "GIT issue #21");
+    });
+};
+
+
 var runAll = function() {
     basicTests();
     clutterTests();
@@ -1978,6 +2015,7 @@ var runAll = function() {
     injectDataTests();
     altVarCallbacks();
     commutativity();
+	newTests();
 };
 
 runAll();

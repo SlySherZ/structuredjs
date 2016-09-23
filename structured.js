@@ -32,6 +32,760 @@
         throw "Error: Both Esprima and UnderscoreJS are required dependencies.";
     }
 
+    /**************************************************************************
+     * LOGGING
+     * 
+     * Provides some neat functionality to trace code execution. Used for
+     * debugging purposes.
+     *************************************************************************/
+    var L = {
+        getParamNames: function(func) {
+            var STRIP_COMMENTS = /((\/\/.*$)|(\/\*[\s\S]*?\*\/))/mg,
+                ARGUMENT_NAMES = /([^\s,]+)/g;
+
+            var fnStr = func.toString().replace(STRIP_COMMENTS, '');
+            var result = fnStr.slice(fnStr.indexOf('(') + 1, fnStr.indexOf(')')).match(ARGUMENT_NAMES);
+            if (result === null)
+                result = [];
+            return result;
+        },
+
+        functionName: function(fun) {
+            var ret = fun.toString();
+            ret = ret.substr('function '.length);
+            ret = ret.substr(0, ret.indexOf('('));
+            return ret;
+        },
+
+        traceCallNumber: 0,
+        traceReturnValue: undefined,
+        traceReturnBuffer: {},
+        flushBuffer: function() {
+            if (_.isEmpty(this.traceReturnBuffer)) {
+                return;
+            }
+
+            // Show buffered values
+            console.log(this.traceReturnBuffer, " -> ", this.traceReturnValue);
+
+            // Reset buffer
+            this.traceReturnBuffer = {};
+        },
+
+        bufferReturn: function(index, callData, value) {
+            if (value !== this.traceReturnValue) {
+                this.flushBuffer();
+                this.traceReturnValue = value;
+            }
+
+            this.traceReturnBuffer[index] = callData;
+        },
+
+        trace: function(f, options) {
+            options = options || {};
+
+            var argNames = this.getParamNames(f);
+            var name = options.name || this.functionName(f) || "anonymous";
+            return function() {
+                var index = this.traceCallNumber++;
+
+                var args = Array.prototype.slice.call(arguments);
+
+                this.flushBuffer();
+
+                var logOutput = [];
+                for (var i = 0; i < args.length; i++) {
+                    logOutput.push("\n\t" + (argNames[i] || "UNDEFINED") + ": ");
+                    try {
+                        logOutput.push(deepClone(args[i]));
+                    } catch (e) { // Cloning failed
+                        logOutput.push(args[i]);
+                    }
+                }
+
+                console.log.apply(console, [(name || "") + "("].concat(logOutput).concat(["\n) [" + index + "]"]));
+
+                var r = f.apply(null, arguments);
+
+                this.bufferReturn(index, {
+                    "name": name,
+                    "args": logOutput
+                }, r); // Out
+
+                return r;
+            }.bind(this)
+        },
+
+    };
+
+    /**************************************************************************
+     * AUXILIARY FUNCTIONS
+     *************************************************************************/
+    var eachNodeDo = function(node, fn) {
+        if (typeof(fn) !== "function") {
+            throw new Error("ARGUMENT ERROR: 'fn' is not a function");
+        }
+
+        if (!_.isObject(node) || _.isArray(node)) {
+            return;
+        }
+
+        for (var key in node) {
+            if (!node.hasOwnProperty(key)) {
+                continue; // Inherited property
+            }
+
+            fn(node[key], key);
+        }
+    };
+
+    var eachNodeSkipArrayDo = function(node, fn) {
+        if (!fn) {
+            console.warn("ARGUMENT ERROR in eachNodeSkipArrayDo: Did you forget to pass fn?");
+        }
+
+        if (_.isArray(node)) {
+            node = {
+                _: node
+            };
+        }
+
+        eachNodeDo(node, function(node, name) {
+            if (_.isArray(node)) {
+                for (var i = 0; i < node.length; i++) {
+                    fn(node[i]);
+                }
+            } else {
+                fn(node);
+            }
+        });
+    };
+
+    function deepClone(obj) {
+        return JSON.parse(JSON.stringify(obj));
+    }
+
+    /**************************************************************************
+     * STRUCTURE PREPROCESSING
+     * 
+     * Simplifies the structure tree into a consistent format, so that minor
+     * differences don't break the match completly
+     *************************************************************************/
+    function parseStructure(structure) {
+        if (typeof structure === "object") {
+            return deepClone(structure);
+        }
+
+        if (structureCache[structure]) {
+            return JSON.parse(structureCache[structure]);
+        }
+
+        // Wrapped in parentheses so function() {} becomes valid Javascript.
+        var fullTree = esprima.parse("(" + structure + ")");
+
+        if (fullTree.body[0].expression.type !== "FunctionExpression" ||
+            !fullTree.body[0].expression.body) {
+            throw "Poorly formatted structure code";
+        }
+
+        var tree = fullTree.body[0].expression.body;
+        structureCache[structure] = JSON.stringify(tree);
+        return tree;
+    }
+
+    /*
+     * Returns a tree parsed out of the structure. The returned tree is an
+     *    abstract syntax tree with wildcard properties set to undefined.
+     *
+     * structure is a specification looking something like:
+     *        function structure() {if (_) { var _ = 3; }}
+     *    where _ denotes a blank (anything can go there),
+     *    and code can go before or after any statement (only the nesting and
+     *        relative ordering matter).
+     */
+    function parseStructureWithVars(structure) {
+        var tree = parseStructure(structure);
+        foldConstants(tree);
+        tree = standardizeTree(tree);
+        return tree;
+    }
+
+    /*
+     * Constant folds the syntax tree
+     */
+    function foldConstants(tree) {
+        for (var key in tree) { /* jshint forin:false */
+            if (!tree.hasOwnProperty(key)) {
+                continue; // Inherited property
+            }
+
+            var ast = tree[key];
+            if (_.isObject(ast)) {
+                foldConstants(ast);
+
+                /*
+                 * Currently, we only fold + and - applied to a number literal.
+                 * This is easy to extend, but it means we lose the ability to match
+                 * potentially useful expressions like 5 + 5 with a pattern like _ + _.
+                 */
+                /* jshint eqeqeq:false */
+                if (ast.type == esprima.Syntax.UnaryExpression) {
+                    var argument = ast.argument;
+                    if (argument.type === esprima.Syntax.Literal &&
+                        _.isNumber(argument.value)) {
+                        if (ast.operator === "-") {
+                            argument.value = -argument.value;
+                            tree[key] = argument;
+                        } else if (ast.operator === "+") {
+                            argument.value = +argument.value;
+                            tree[key] = argument;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /*
+     * return true if n2 < n1 (according to relatively arbitrary criteria)
+     */
+    function shouldSwap(n1, n2) {
+        if (n1.type < n2.type) { //Sort by node type if different
+            return false;
+        } else if (n1.type > n2.type) {
+            return true;
+        } else if (n1.type === "Literal") { //Sort by value if they're literals
+            return n1.raw > n2.raw;
+        } else { //Otherwise, loop through the properties until a difference is found and sort by that
+            for (var k in n1) {
+                if (n1[k].hasOwnProperty("type") && n1[k] !== n2[k]) {
+                    return shouldSwap(n1[k], n2[k]);
+                }
+            }
+        }
+    }
+
+    function standardizeTree(tree) {
+        if (!tree) {
+            return tree;
+        }
+        var r = deepClone(tree);
+        switch (tree.type) {
+
+            case "BinaryExpression":
+                if (_.contains(["*", "+", "===", "!==", "==", "!=", "&", "|", "^"], tree.operator)) {
+                    if (shouldSwap(tree.left, tree.right)) {
+                        r.left = standardizeTree(tree.right);
+                        r.right = standardizeTree(tree.left);
+                    } else {
+                        r.left = standardizeTree(tree.left);
+                        r.right = standardizeTree(tree.right);
+                    }
+                } else if (tree.operator[0] === ">") {
+                    r.operator = "<" + tree.operator.slice(1);
+                    r.left = standardizeTree(tree.right);
+                    r.right = standardizeTree(tree.left);
+                }
+                break;
+
+            case "LogicalExpression":
+                if (_.contains(["&&", "||"], tree.operator) &&
+                    shouldSwap(tree.left, tree.right)) {
+                    r.left = standardizeTree(tree.right);
+                    r.right = standardizeTree(tree.left);
+                }
+                break;
+
+            case "AssignmentExpression":
+                if (_.contains(["+=", "-=", "*=", "/=", "%=", "<<=", ">>=", ">>>=", "&=", "^=", "|="], tree.operator)) {
+                    var l = standardizeTree(tree.left);
+                    r = {
+                        type: "AssignmentExpression",
+                        operator: "=",
+                        left: l,
+                        right: {
+                            type: "BinaryExpression",
+                            operator: tree.operator.slice(0, -1),
+                            left: l,
+                            right: standardizeTree(tree.right)
+                        }
+                    };
+                } else {
+                    r.left = standardizeTree(r.left);
+                    r.right = standardizeTree(r.right);
+                }
+                break;
+
+            case "UpdateExpression":
+                if (_.contains(["++", "--"], tree.operator)) {
+                    var l = standardizeTree(tree.argument);
+                    r = {
+                        type: "AssignmentExpression",
+                        operator: "=",
+                        left: l,
+                        right: {
+                            type: "BinaryExpression",
+                            operator: tree.operator[0],
+                            left: l,
+                            right: {
+                                type: "Literal",
+                                value: 1,
+                                raw: "1"
+                            }
+                        }
+                    };
+                }
+                break;
+
+            case "VariableDeclaration":
+                if (tree.kind === "var") {
+                    r = [deepClone(tree)];
+                    for (var i in tree.declarations) {
+                        if (tree.declarations[i].type === "VariableDeclarator" &&
+                            tree.declarations[i].init !== null) {
+                            r.push({
+                                type: "ExpressionStatement",
+                                expression: {
+                                    type: "AssignmentExpression",
+                                    operator: "=",
+                                    left: tree.declarations[i].id,
+                                    right: standardizeTree(tree.declarations[i].init)
+                                }
+                            });
+                            r[0].declarations[i].init = null;
+                        }
+                    }
+                }
+                break;
+
+            case "Literal":
+                r.raw = tree.raw
+                    .replace(/^(?:\"(.*?)\"|\'(.*?)\')$/, function(match, p1, p2) {
+                        return "\"" + ((p1 || "") + (p2 || ""))
+                            .replace(/"|'/g, "\"") + "\"";
+                    });
+                break;
+
+            case "Program":
+                r.type = "BlockStatement";
+                // Fall through
+
+            default:
+                for (var key in tree) {
+                    if (!tree.hasOwnProperty(key) || !_.isObject(tree[key])) {
+                        continue;
+                    }
+
+                    if (_.isArray(tree[key])) {
+                        var ar = [];
+                        for (var i in tree[key]) { /* jshint forin:false */
+                            ar = ar.concat(standardizeTree(tree[key][i]));
+                        }
+                        r[key] = ar;
+                    } else {
+                        if (key === "value" || (tree[key] !== undefined && tree[key] !== null)) {
+                            r[key] = standardizeTree(tree[key]);
+                        }
+                    }
+                }
+        }
+        return r;
+    }
+
+    /*
+     * Returns whether the structure node is intended as a wildcard node, which
+     * can be filled in by anything in others' code.
+     */
+    function isWildcard(node) {
+        return node.name && node.name === "_";
+    }
+
+    /* Returns whether the structure node is intended as a wildcard variable. */
+    function isWildcardVariable(node) {
+        return (node.name && _.isString(node.name) && node.name.length >= 2 &&
+            node.name[0] === "$");
+    }
+
+
+    /**************************************************************************
+     * MATCHING CACHE
+     * 
+     * Every time we compare two objects, we save the results to reuse later.
+     * This provides an important speed up.
+     * 
+     * The first time we find an object, we tag it with a 'structuredID' so that
+     * we can easily recognize it later on. 
+     * 
+     * TODO: Fix 'structuredID' properties sometimes leaking to user callbacks
+     * TODO: Improve algorithm to tag objects with the correct 'structuredID'
+     *************************************************************************/
+    function deepCompare(a, b) {
+        if (a === b) {
+            return true;
+        }
+
+        if (!_.isObject(a) || !_.isObject(b)) {
+            return false;
+        }
+
+        for (var key in a) {
+            if (key === "structuredID") continue;
+
+            if (!a.hasOwnProperty(key)) {
+                continue;
+            }
+
+            if (!deepCompare(a[key], b[key])) {
+                return false;
+            }
+        }
+
+        for (var key in b) {
+            if (key === "structuredID") continue;
+            if (!b.hasOwnProperty(key)) {
+                continue;
+            }
+
+            if (!deepCompare(a[key], b[key])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+	// Stores an index for each object. Equal objects have equal indices.
+    var indexCache = [];
+    var indexNode = function(node) {
+        if (!_.isObject(node)) {
+            return;
+        }
+
+        if (node.structuredID !== undefined) return;
+
+        for (var i = 0; i < indexCache.length; i++) {
+            var cacheNode = indexCache[i];
+            //if (_.isEqual(cacheNode, node)) {
+            if (deepCompare(cacheNode, node)) {
+                node.structuredID = i;
+                return;
+            }
+        }
+
+        indexCache.push(deepClone(node));
+        node.structuredID = indexCache.length - 1;
+    };
+
+    var indexRecursively = function(tree) {
+        indexNode(tree);
+        eachNodeSkipArrayDo(tree, indexRecursively);
+    };
+
+	
+    var cacheHits = [0, 0]; // Statistics for cache hits
+    var matchCache = [];
+    var getFromCache = function(currentNode, toFind) {
+        if (!currentNode || !toFind) {
+            throw "ARGUMENT ERROR: Cannot cache item because it's not an object!";
+        }
+        cacheHits[0]++;
+
+        if (currentNode.structuredID === undefined) {
+            console.log(currentNode);
+            throw new Error("ARGUMENT ERROR: Structure has not been indexed!");
+        }
+
+        if (toFind.structuredID === undefined) {
+            console.log(toFind);
+            throw new Error("ARGUMENT ERROR: Structure has not been indexed!");
+        }
+
+        var c1 = matchCache[toFind.structuredID];
+
+        if (c1) {
+            if (c1[currentNode.structuredID] !== undefined) {
+                cacheHits[1]++;
+            }
+            return c1[currentNode.structuredID];
+        }
+    };
+
+    var saveToCache = function(currentNode, toFind, result) {
+        if (!_.isObject(toFind) || !_.isObject(currentNode)) {
+            throw new Error("ARGUMENT ERROR: not an object!");
+        }
+
+        if (!matchCache[toFind.structuredID]) {
+            matchCache[toFind.structuredID] = [];
+        }
+
+        matchCache[toFind.structuredID][currentNode.structuredID] = result;
+        return result;
+    };
+
+
+    /**************************************************************************
+     * RESULTS HANDLING
+     * 
+     * A result looks like this: 
+     * 	{
+     * 		wVars: [{
+     * 			$a: 1,
+     * 			$b: 2
+     * 		}, {
+     * 			$a: 3,
+     * 			$b: 2
+     * 		}]
+     * 	}
+     * 
+     * Each element in the 'wVars' array contains one of the possibilities for 
+     * the user variable's values. 'wVars' is true if it didn't find any user
+     * variables yet. 
+     * 
+     * These functions simplify the task of merging results where both have to 
+     * pass (AND) or just one has to pass (OR).
+     *************************************************************************/
+    var matchesAll = {
+        wVars: true
+    };
+    var matchesNone = false;
+
+    function orResults(a, b) {
+        if (!a) {
+            return b;
+        }
+
+        if (!b) {
+            return a;
+        }
+
+        return {
+            wVars: orWVarsResults(a.wVars, b.wVars)
+        };
+		
+		function orWVarsResults(a, b) {
+			if (a === true || b === true) {
+				return true;
+			}
+
+			return a.concat(b);
+		};
+    }
+
+    function andResults(a, b) {
+        if (!a || !b) {
+            return false;
+        }
+
+        var wVars = andWVarsResults(a.wVars, b.wVars);
+        if (wVars.length === 0) {
+            return false;
+        }
+
+        return {
+            wVars: wVars
+        }
+		
+		function andWVarsResults(a, b) {
+			if (a === true) return b;
+			if (b === true) return a;
+
+			var result = [];
+			for (var i = 0; i < a.length; i++) {
+				for (var j = 0; j < b.length; j++) {
+					var merged = mergeRules(a[i], b[j]);
+					if (merged) {
+						result.push(merged);
+					}
+				}
+			}
+
+			return result;
+			
+			function mergeRules(a, b) {
+				var result = {};
+				for (var key in a) {
+					if (b[key] && a[key].structuredID !== b[key].structuredID) {
+						return matchesNone;
+					}
+
+					result[key] = a[key];
+				}
+
+				for (var key in b) {
+					if (!a[key]) {
+						result[key] = b[key];
+					}
+				}
+
+				return result;
+			};
+		}
+    }
+
+    var makeGroup = function(key, value) {
+        var data = {};
+        data[key] = value;
+
+        return {
+            wVars: [data]
+        };
+    };
+
+
+    /**************************************************************************
+     * STRUCTURED CORE
+     * 
+     * Provides the functionality to look for one AST inside another AST
+     * Returns all possible matches, with the format described in the RESULTS
+     * section
+     *************************************************************************/
+	
+	// Looks for 'toFind' in 'currentNode' properties
+    function searchInside(currentNode, toFind) {
+        var result = matchesNone;
+        for (var key in currentNode) {
+            if (!currentNode.hasOwnProperty(key)) continue;
+            if (key === "structuredID") continue;
+
+            var r = matchTree(currentNode[key], toFind);
+            if (r === matchesAll) return matchesAll
+            else result = orResults(result, r);
+        }
+
+        return result;
+    }
+
+	// Checks if all the properties in 'toFind' object match properties in 'currentNode' object
+    function checkAll(currentNode, toFind) {
+        var result = matchesAll;
+        for (var key in toFind) {
+            if (!toFind.hasOwnProperty(key)) continue;
+            if (key === "structuredID") continue;
+
+            var r = matchTree(currentNode[key], toFind[key]);
+            if (r === matchesNone) return matchesNone
+            else result = andResults(result, r);
+        }
+
+        return result;
+    }
+
+	// Matches AST 'toFind' against AST 'currentNode', returns all possible matches.
+	// Chech the RESULTS section for the return format
+    function matchTree(currentNode, toFind) {
+        if (_.isArray(toFind)) {
+            if (toFind.length === 0) {
+                return matchesAll;
+            }
+
+            if (toFind.length === 1) {
+                return matchTree(currentNode, toFind[0]);
+            }
+
+            if (_.isArray(currentNode)) {
+                if (currentNode.length === 0) {
+                    return matchesNone;
+                }
+
+                var result = matchesNone;
+			
+                // See what we can find in the first element
+                var currentHead = currentNode[0];
+                var currentTail = currentNode.slice(1);
+
+                for (var i = 0; i <= toFind.length; i++) {
+                    var findHead = toFind.slice(0, i);
+                    var findTail = toFind.slice(i);
+
+                    var headResult = matchTree(currentHead, findHead);
+                    var tailResult = matchTree(currentTail, findTail);
+
+					// If the head already fails, looking for even more elements also fails
+                    if (headResult === matchesNone) {
+                        break;
+                    }
+
+                    var thisResult = andResults(headResult, tailResult);
+
+					// If we already have a complete match, halt early
+                    if (thisResult === matchesAll) return matchedAll;
+
+                    result = orResults(result, thisResult);
+                }
+
+                return result;
+            } else if (_.isObject(currentNode)) {
+                return searchInside(currentNode, toFind);
+            }
+
+            return matchesNone;
+        }
+
+        if (_.isArray(currentNode)) {
+            var result = matchesNone;
+
+            for (var i = 0; i < currentNode.length; i++) {
+                result = orResults(result, matchTree(currentNode[i], toFind));
+            }
+
+            return result;
+        }
+
+        if (_.isObject(toFind)) {
+            if (_.isObject(currentNode)) {
+                return matchObjectTree(currentNode, toFind);
+            }
+
+            return matchesNone;
+        }
+
+        return (toFind === currentNode || toFind === null) ? 	matchesAll :
+																matchesNone;
+    }
+
+	// Helper to matchTree, matches object vs object
+    function matchObjectTree(currentNode, toFind) {
+		if (!_.isObject(toFind) || _.isArray(toFind) 
+		|| 	!_.isObject(currentNode) || _.isArray(currentNode)) {
+            throw new Error("Argument error: Not an object!");
+        }
+		
+        var cached;
+        if ((cached = getFromCache(currentNode, toFind)) !== undefined) {
+            return cached;
+        }
+
+        if (isWildcard(toFind)) {
+            return saveToCache(currentNode, toFind, matchesAll);
+        }
+
+        if (isWildcardVariable(toFind)) {
+            var result = matchesNone;
+            var getNode = function(node) {
+                if (_.isObject(node)) {
+                    result = orResults(result, makeGroup(toFind.name, node));
+                    eachNodeSkipArrayDo(node, getNode);
+                }
+            }
+
+            getNode(currentNode);
+
+            return saveToCache(currentNode, toFind, result);
+        }
+
+        // Check if all of the 'toFind' properties match
+        var result = checkAll(currentNode, toFind);
+
+        // Also check recursively inside 'currentNode'
+        result = orResults(result, searchInside(currentNode, toFind));
+
+        return saveToCache(currentNode, toFind, result);
+    };
+
+    /**************************************************************************
+     * INTERFACE
+     *************************************************************************/
     /*
      * Introspects a callback to determine it's parameters and then
      * produces a constraint that contains the appropriate variables and callbacks.
@@ -41,7 +795,16 @@
      */
     function makeConstraint(callback) {
         var paramText = /^function [^\(]*\(([^\)]*)\)/.exec(callback)[1];
-        var params = paramText.match(/[$_a-zA-z0-9]+/g);
+        var params = parseCallbackNames(paramText);
+
+        return {
+            variables: params,
+            fn: callback
+        };
+    }
+
+    function parseCallbackNames(str) {
+        var params = str.match(/[$_a-zA-z0-9]+/g);
 
         for (var key in params) {
             if (params[key][0] !== "$") {
@@ -49,120 +812,45 @@
                 return null;
             }
         }
-        return {
-            variables: params,
-            fn: callback
-        };
+
+        return params;
     }
-    
-    /*
-     * return true if n2 < n1 (according to relatively arbitrary criteria)
-     */
-    function shouldSwap(n1, n2) {
-	if (n1.type < n2.type) { //Sort by node type if different
-	    return false;
-	} else if (n1.type > n2.type) {
-	    return true;
-	} else if (n1.type === "Literal") { //Sort by value if they're literals
-	    return n1.raw > n2.raw;
-	} else { //Otherwise, loop through the properties until a difference is found and sort by that
-	    for (var k in n1) {
-		if (n1[k].hasOwnProperty("type") && n1[k] !== n2[k]) {
-		    return shouldSwap(n1[k], n2[k]);
-		}
-	    }
-	}
-    }
-    function standardizeTree(tree) {
-	if (!tree) {return tree;}
-        var r = deepClone(tree);
-        switch (tree.type) {
-            case "BinaryExpression":
-                if (_.contains(["*", "+", "===", "!==", "==", "!=", "&", "|", "^"], tree.operator)) {
-		    if (shouldSwap(tree.left, tree.right)) {
-			r.left = standardizeTree(tree.right);
-			r.right = standardizeTree(tree.left);
-            } else {
-                r.left = standardizeTree(tree.left);
-                r.right = standardizeTree(tree.right);
+
+    // [{names: ["$a", "$b"], fn: function (a, b) {}}]
+    function extractSingleCallback(rawCallback, paramText) {
+        if (rawCallback instanceof Function) {
+            if (typeof(paramText) === "number") {
+                return makeConstraint(rawCallback);
             }
-		} else if (tree.operator[0] === ">") {
-		    r.operator = "<" + tree.operator.slice(1);
-		    r.left = standardizeTree(tree.right);
-		    r.right = standardizeTree(tree.left);
-		} break;
-	    case "LogicalExpression":
-	        if (_.contains(["&&", "||"], tree.operator) &&
-		    shouldSwap(tree.left, tree.right)) {
-		    r.left = standardizeTree(tree.right);
-		    r.right = standardizeTree(tree.left);
-		} break;
-	    case "AssignmentExpression":
-	        if (_.contains(["+=", "-=", "*=", "/=", "%=", "<<=", ">>=", ">>>=", "&=", "^=", "|="], tree.operator)) {
-		    var l = standardizeTree(tree.left);
-		    r = {type: "AssignmentExpression",
-			 operator: "=",
-			 left: l,
-			 right: {type: "BinaryExpression",
-				 operator: tree.operator.slice(0,-1),
-				 left: l,
-				 right: standardizeTree(tree.right)}};
-		} else {
-            r.left = standardizeTree(r.left);
-            r.right = standardizeTree(r.right);
-        } break;
-	    case "UpdateExpression":
-	        if (_.contains(["++", "--"], tree.operator)) {
-		    var l = standardizeTree(tree.argument);
-		    r = {type: "AssignmentExpression",
-			 operator: "=",
-			 left: l,
-			 right: {type: "BinaryExpression",
-				 operator: tree.operator[0],
-				 left: l,
-				 right: {type: "Literal",
-					 value: 1,
-					 raw: "1"}}};
-		} break;
-	    case "VariableDeclaration":
-	        if (tree.kind === "var") {
-		    r = [deepClone(tree)];
-		    for (var i in tree.declarations) {
-			if (tree.declarations[i].type === "VariableDeclarator" &&
-			    tree.declarations[i].init !== null) {
-			    r.push({type: "ExpressionStatement",
-				    expression: {type: "AssignmentExpression",
-						 operator: "=",
-						 left: tree.declarations[i].id,
-						 right: standardizeTree(tree.declarations[i].init)}});
-			    r[0].declarations[i].init = null;
-			}
-		    }
-		} break;
-        case "Literal":
-            r.raw = tree.raw
-                .replace(/^(?:\"(.*?)\"|\'(.*?)\')$/, function(match, p1, p2) {
-                    return "\"" + ((p1 || "") + (p2 || ""))
-                        .replace(/"|'/g, "\"") + "\"";
-                });
-            console.log(r.raw); break;
-	    default:
-	        for (var key in tree) {
-		    if (!tree.hasOwnProperty(key) || !_.isObject(tree[key])) {
-			continue;
-		    }
-		    if (_.isArray(tree[key])) {
-			var ar = [];
-			for (var i in tree[key]) {  /* jshint forin:false */
-			    ar = ar.concat(standardizeTree(tree[key][i]));
-			}
-			r[key] = ar;
-		    } else {
-			r[key] = standardizeTree(tree[key]);
-		    }
-		}
+
+            return {
+                variables: parseCallbackNames(paramText),
+                fn: rawCallback
+            }
         }
-        return r;
+
+        if (_.isObject(rawCallback)) {
+            if (rawCallback.variables && rawCallback.fn) {
+                return rawCallback;
+            }
+        }
+
+        console.warn(rawCallback);
+        throw new Error("ARGUMENT ERROR: Invalid callback!");
+    }
+
+    function extractAllCallbacks(rawCallbacks) {
+        if (!rawCallbacks) {
+            return [];
+        }
+
+        if (_.isObject(rawCallbacks)) {
+            if (!rawCallbacks.variables || !rawCallback.fn) {
+                return _.map(rawCallbacks, extractSingleCallback);
+            }
+        }
+
+        return [extractSingleCallback(rawCallbacks)];
     }
 
     /*
@@ -203,7 +891,6 @@
      *   };
      *   match(code, rawStructure, {varCallbacks: varCallbacks});
      */
-    var originalVarCallbacks;
     function match(code, rawStructure, options) {
         options = options || {};
         // Many possible inputs formats are accepted for varCallbacks
@@ -212,146 +899,80 @@
         // 2. an objects (which already has separate .fn and .variables properties)
         //
         // It will also accept a list of either of the above (or a mix of the two).
-        // Finally it can accept an object for which the keys are the variables and 
-        // the values are the callbacks (This option is mainly for historical reasons)
-        var varCallbacks = options.varCallbacks || [];
-        // We need to keep a hold of the original varCallbacks object because 
-        // When structured first came out it returned the failure message by 
-        // changing the .failure property on the varCallbacks object and some uses rely on that.
-        // We hope to get rid of this someday.
-        // TODO: Change over the code so to have a better API
-        originalVarCallbacks = varCallbacks;
-        if (varCallbacks instanceof Function || (varCallbacks.fn && varCallbacks.variables)) {
-            varCallbacks = [varCallbacks];
-        }
-        if (varCallbacks instanceof Array) {
-            for (var key in varCallbacks) {
-                if (varCallbacks[key] instanceof Function) {
-                    varCallbacks[key] = makeConstraint(varCallbacks[key]);
-                }
-            }
-        } else {
-            var realCallbacks = [];
-            for (var vars in varCallbacks) {
-                if (varCallbacks.hasOwnProperty(vars) && vars !== "failure") {
-                    realCallbacks.push({
-                        variables: vars.match(/[$_a-zA-z0-9]+/g),
-                        fn: varCallbacks[vars]
-                    });
-                }
-            }
-            varCallbacks = realCallbacks;
-        }
-        var wildcardVars = {
-            order: [],
-            skipData: {},
-            values: {}
-        };
+
+        var varCallbacks = extractAllCallbacks(options.varCallbacks);
+
         // Note: After the parse, structure contains object references into
         // wildcardVars[values] that must be maintained. So, beware of
         // JSON.parse(JSON.stringify), etc. as the tree is no longer static.
-        var structure = parseStructureWithVars(rawStructure, wildcardVars);
+        var structure = parseStructureWithVars(rawStructure);
 
         // Cache the parsed code tree, or pull from cache if it exists
-        var codeTree = (cachedCode === code ?
-            cachedCodeTree :
-            typeof code === "object" ?
-            deepClone(code) :
-            esprima.parse(code));
-
-        cachedCode = code;
-        cachedCodeTree = codeTree;
-
-        foldConstants(codeTree);
-        var toFind = structure.body || structure;
-        var peers = [];
-        if (_.isArray(structure.body)) {
-            toFind = structure.body[0];
-            peers = structure.body.slice(1);
-        }
-        var result;
-        var matchResult = {
-            _: [],
-            vars: {}
-        };
-	codeTree = standardizeTree(codeTree);
-        if (wildcardVars.order.length === 0 || options.single) {
-            // With no vars to match, our normal greedy approach works great.
-            result = checkMatchTree(codeTree, toFind, peers, wildcardVars, matchResult, options);
+        var codeTree;
+        if (cachedCode === code) {
+            codeTree = cachedCodeTree;
         } else {
-            // If there are variables to match, we must do a potentially
-            // exhaustive search across the possible ways to match the vars.
-            result = anyPossible(0, wildcardVars, varCallbacks, matchResult, options);
-        }
-        return result;
+            codeTree = (typeof code === "object" ? deepClone(code) :
+                esprima.parse(code)
+            )
+            foldConstants(codeTree);
+            codeTree = standardizeTree(codeTree);
 
-        /*
-         * Checks whether any possible valid variable assignment for this i
-         *  results in a valid match.
-         *
-         * We orchestrate this check by building skipData, which specifies
-         *  for each variable how many possible matches it should skip before
-         *  it guesses a match. The iteration over the tree is the same
-         *  every time -- if the first guess fails, the next run will skip the
-         *  first guess and instead take the second appearance, and so on.
-         *
-         * When there are multiple variables, changing an earlier (smaller i)
-         *  variable guess means that we must redo the guessing for the later
-         *  variables (larger i).
-         *
-         * Returning false involves exhausting all possibilities. In the worst
-         *  case, this will mean exponentially many possibilities -- variables
-         *  are expensive for all but small tests.
-         *
-         * wildcardVars = wVars:
-         *     .values[varName] contains the guessed node value of each
-         *     variable, or the empty object if none.
-         *     .skipData[varName] contains the number of potential matches of
-         *          this var to skip before choosing a guess to assign to values
-         *     .leftToSkip[varName] stores the number of skips left to do
-         *         (used during the match algorithm)
-         *     .order[i] is the name of the ith occurring variable.
-         */
-        function anyPossible(i, wVars, varCallbacks, matchResults, options) {
-            var order = wVars.order; // Just for ease-of-notation.
-            wVars.skipData[order[i]] = 0;
-            do {
-                // Reset the skip # for all later variables.
-                for (var rest = i + 1; rest < order.length; rest += 1) {
-                    wVars.skipData[order[rest]] = 0;
-                }
-                // Check for a match only if we have reached the last var in
-                // order (and so set skipData for all vars). Otherwise,
-                // recurse to check all possible values of the next var.
-                if (i === order.length - 1) {
-                    // Reset the wildcard vars' guesses. Delete the properties
-                    // rather than setting to {} in order to maintain shared
-                    // object references in the structure tree (toFind, peers)
-                    _.each(wVars.values, function(value, key) {
-                        _.each(wVars.values[key], function(v, k) {
-                            delete wVars.values[key][k];
-                        });
-                    });
-                    wVars.leftToSkip = _.extend({}, wVars.skipData);
-                    // Use a copy of peers because peers is destructively
-                    // modified in checkMatchTree (via checkNodeArray).
-                    if (checkMatchTree(codeTree, toFind, peers.slice(), wVars, matchResults, options) &&
-                        checkUserVarCallbacks(wVars, varCallbacks)) {
-                        return matchResults;
-                    }
-                } else if (anyPossible(i + 1, wVars, varCallbacks, matchResults, options)) {
-                    return matchResults;
-                }
-                // This guess didn't work out -- skip it and try the next.
-                wVars.skipData[order[i]] += 1;
-                // The termination condition is when we have run out of values
-                // to skip and values is no longer defined for this var after
-                // the match algorithm. That means that there is no valid
-                // assignment for this and later vars given the assignments to
-                // previous vars (set by skipData).
-            } while (!_.isEmpty(wVars.values[order[i]]));
-            return false;
+            // Save for next match
+            cachedCode = code;
+            cachedCodeTree = codeTree;
+
+            // Reset cache
+            matchCache = [];
+            indexCache = [];
+            indexRecursively(codeTree);
         }
+
+        indexRecursively(structure);
+        var result = matchTree(codeTree, structure);
+
+        if (!result) {
+            return {
+                matched: false,
+                failedOn: -1
+            };
+        }
+
+        var wVars = result.wVars;
+
+        if (wVars === true) {
+            return checkUserVarCallbacks({}, varCallbacks);
+        }
+
+        var closestMatch = {
+            matched: true,
+            failedOn: -1
+        };
+        for (var i = 0; i < wVars.length; i++) {
+            var singleResult = checkUserVarCallbacks(wVars[i], varCallbacks);
+
+            if (singleResult.matched) {
+                return singleResult;
+            }
+
+            if (singleResult.failedOn > closestMatch.failedOn) {
+                closestMatch = singleResult;
+            }
+        }
+
+        //console.log("Cache was used " + (100 * cacheHits[1] / cacheHits[0]).toFixed(2)+ "% of the time. [" + cacheHits[1] + "/" + cacheHits[0] + "]");
+        return closestMatch;
+    }
+
+    function getWValues(wVars) {
+        if (!wVars) return {};
+
+        var newWVars = {};
+        for (var key in wVars) {
+            newWVars[key] = deepClone(indexCache[wVars[key].structuredID]);
+        }
+
+        return newWVars;
     }
 
     /*
@@ -387,39 +1008,58 @@
      *   }
      */
     function checkUserVarCallbacks(wVars, varCallbacks) {
-        // Clear old failure message if needed
-        delete originalVarCallbacks.failure;
-        for (var key in varCallbacks) {  /* jshint forin:false */
+        // Clone at the beginning and reuse the same object to allow user 
+        // changes
+        wVars = getWValues(wVars);
+
+        for (var i = 0; i < varCallbacks.length; i++) {
             // Property strings may be "$foo, $bar, $baz" to mimic arrays.
-            var varNames = varCallbacks[key].variables;
+            // Trim whitespace
+            var varNames = _.map(varCallbacks[i].variables, stringLeftTrim);
             var varValues = _.map(varNames, function(varName) {
-                varName = stringLeftTrim(varName); // Trim whitespace
                 // If the var name is in the structure, then it will always
                 // exist in wVars.values after we find a match prior to
                 // checking the var callbacks. So, if a variable name is not
                 // defined here, it is because that var name does not exist in
                 // the user-defined structure.
-                if (!_.has(wVars.values, varName)) {
+                if (!_.has(wVars, varName)) {
                     console.error("Callback var " + varName + " doesn't exist");
                     return undefined;
                 }
                 // Convert each var name to the Esprima structure it has
                 // been assigned in the parse. Make a deep copy.
-                return deepClone(wVars.values[varName]);
+                return wVars[varName];
             });
+
             // Call the user-defined callback, passing in the var values as
             // parameters in the order that the vars were defined in the
             // property string.
-            var result = varCallbacks[key].fn.apply(null, varValues);
-            if (!result || _.has(result, "failure")) {
-                // Set the failure message if the user callback provides one.
+
+            var result = varCallbacks[i].fn.apply(null, varValues);
+            if (!result) {
+                return {
+                    matched: false,
+                    failedOn: i
+                };
+            } else if (_.isObject(result)) {
                 if (_.has(result, "failure")) {
-                    originalVarCallbacks.failure = result.failure;
+                    return {
+                        matched: false,
+                        failedOn: i,
+                        failure: result.failure
+                    };
+                } else if (_.has(result, "extend")) {
+                    // We allow adding/changing value data, so that users can
+                    // define new variables on one constraint and use it after
+                    _.extend(wVar, result.extend);
                 }
-                return false;
             }
         }
-        return true;
+
+        return {
+            matched: true,
+            vars: wVars
+        };
 
         /* Trim is only a string method in IE9+, so use a regex if needed. */
         function stringLeftTrim(str) {
@@ -428,437 +1068,6 @@
             }
             return str.replace(/^\s+|\s+$/g, "");
         }
-    }
-
-    function parseStructure(structure) {
-        if (typeof structure === "object") {
-            return deepClone(structure);
-        }
-
-        if (structureCache[structure]) {
-            return JSON.parse(structureCache[structure]);
-        }
-
-        // Wrapped in parentheses so function() {} becomes valid Javascript.
-        var fullTree = esprima.parse("(" + structure + ")");
-
-        if (fullTree.body[0].expression.type !== "FunctionExpression" ||
-            !fullTree.body[0].expression.body) {
-            throw "Poorly formatted structure code";
-        }
-
-        var tree = fullTree.body[0].expression.body;
-        structureCache[structure] = JSON.stringify(tree);
-        return tree;
-    }
-
-    /*
-     * Returns a tree parsed out of the structure. The returned tree is an
-     *    abstract syntax tree with wildcard properties set to undefined.
-     *
-     * structure is a specification looking something like:
-     *        function structure() {if (_) { var _ = 3; }}
-     *    where _ denotes a blank (anything can go there),
-     *    and code can go before or after any statement (only the nesting and
-     *        relative ordering matter).
-     */
-    function parseStructureWithVars(structure, wVars) {
-        var tree = standardizeTree(parseStructure(structure));
-        foldConstants(tree);
-        simplifyTree(tree, wVars);
-        return tree;
-    }
-
-    /*
-     * Constant folds the syntax tree
-     */
-    function foldConstants(tree) {
-        for (var key in tree) {  /* jshint forin:false */
-            if (!tree.hasOwnProperty(key)) {
-                continue; // Inherited property
-            }
-
-            var ast = tree[key];
-            if (_.isObject(ast)) {
-                foldConstants(ast);
-
-                /*
-                 * Currently, we only fold + and - applied to a number literal.
-                 * This is easy to extend, but it means we lose the ability to match
-                 * potentially useful expressions like 5 + 5 with a pattern like _ + _.
-                 */
-                /* jshint eqeqeq:false */
-                if (ast.type == esprima.Syntax.UnaryExpression) {
-                    var argument = ast.argument;
-                    if (argument.type === esprima.Syntax.Literal &&
-                        _.isNumber(argument.value)) {
-                        if (ast.operator === "-") {
-                            argument.value = -argument.value;
-                            tree[key] = argument;
-                        } else if (ast.operator === "+") {
-                            argument.value = +argument.value;
-                            tree[key] = argument;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /*
-     * Recursively traverses the tree and sets _ properties to undefined
-     * and empty bodies to null.
-     *
-     *  Wildcards are explicitly set to undefined -- these undefined properties
-     *  must exist and be non-null in order for code to match the structure.
-     *
-     *  Wildcard variables are set up such that the first occurrence of the
-     *   variable in the structure tree is set to {wildcardVar: varName},
-     *   and all later occurrences just refer to wVars.values[varName],
-     *   which is an object assigned during the matching algorithm to have
-     *   properties identical to our guess for the node matching the variable.
-     *   (maintaining the reference). In effect, these later accesses
-     *   to tree[key] mimic tree[key] simply being set to the variable value.
-     *
-     *  Empty statements are deleted from the tree -- they need not be matched.
-     *
-     *  If the subtree is an array, we just iterate over the array using
-     *    for (var key in tree)
-     *
-     */
-    function simplifyTree(tree, wVars) {
-        for (var key in tree) {  /* jshint forin:false */
-            if (!tree.hasOwnProperty(key)) {
-                continue; // Inherited property
-            }
-            if (_.isObject(tree[key])) {
-                if (isWildcard(tree[key])) {
-                    tree[key] = undefined;
-                } else if (isWildcardVar(tree[key])) {
-                    var varName = tree[key].name;
-                    if (!wVars.values[varName]) {
-                        // Perform setup for the first occurrence.
-                        wVars.values[varName] = {}; // Filled in later.
-                        tree[key] = {
-                            wildcardVar: varName
-                        };
-                        wVars.order.push(varName);
-                        wVars.skipData[varName] = 0;
-                    } else {
-                        tree[key] = wVars.values[varName]; // Reference.
-                    }
-                } else if (tree[key].type === esprima.Syntax.EmptyStatement) {
-                    // Arrays are objects, but delete tree[key] does not
-                    //  update the array length property -- so, use splice.
-                    _.isArray(tree) ? tree.splice(key, 1) : delete tree[key];
-                } else {
-                    simplifyTree(tree[key], wVars);
-                }
-            }
-        }
-    }
-
-    /*
-     * Returns whether the structure node is intended as a wildcard node, which
-     * can be filled in by anything in others' code.
-     */
-    function isWildcard(node) {
-        return node.name && node.name === "_";
-    }
-
-    /* Returns whether the structure node is intended as a wildcard variable. */
-    function isWildcardVar(node) {
-        return (node.name && _.isString(node.name) && node.name.length >= 2 &&
-            node.name[0] === "$");
-    }
-
-    /*
-     *
-     */
-    function isGlob(node) {
-        return node && node.name &&
-            ((node.name === "glob_" && "_") ||
-                (node.name.indexOf("glob$") === 0 && node.name.slice(5))) ||
-            node && node.expression && isGlob(node.expression);
-    }
-
-    /*
-     * Returns true if currTree matches the wildcard structure toFind.
-     *
-     * currTree: The syntax node tracking our current place in the user's code.
-     * toFind: The syntax node from the structure that we wish to find.
-     * peersToFind: The remaining ordered syntax nodes that we must find after
-     *     toFind (and on the same level as toFind).
-     * modify: should it call RestructureTree()?
-     */
-    function checkMatchTree(currTree, toFind, peersToFind, wVars, matchResults, options) {
-        if (_.isArray(toFind)) {
-            console.error("toFind should never be an array.");
-            console.error(toFind);
-        }
-        /* jshint -W041, -W116 */
-        if (currTree == undefined) {
-            if (toFind == undefined) {
-                matchResults._.push(currTree);
-                return matchResults;
-            } else {
-                return false;
-            }
-        }
-        if (exactMatchNode(currTree, toFind, peersToFind, wVars, matchResults, options)) {
-            return matchResults;
-        }
-        // Don't recurse if we're just checking a single node.
-        if (options.single) {
-            return false;
-        }
-        // Check children.
-        for (var key in currTree) {  /* jshint forin:false */
-            if (!currTree.hasOwnProperty(key) || !_.isObject(currTree[key])) {
-                continue; // Skip inherited properties
-            }
-            // Recursively check for matches
-            if ((_.isArray(currTree[key]) &&
-                    checkNodeArray(currTree[key], toFind, peersToFind, wVars, matchResults, options, true)) ||
-                (!_.isArray(currTree[key]) &&
-                    checkMatchTree(currTree[key], toFind, peersToFind, wVars, matchResults, options, true))) {
-                return matchResults;
-            }
-        }
-        return false;
-    }
-
-    /*
-     * Returns true if this level of nodeArr matches the node in
-     * toFind, and also matches all the nodes in peersToFind in order.
-     */
-    function checkNodeArray(nodeArr, toFind, peersToFind, wVars, matchResults, options) {
-        var curGlob;
-
-        for (var i = 0; i < nodeArr.length; i += 1) {
-            if (isGlob(toFind)) {
-                if (!curGlob) {
-                    curGlob = [];
-                    var globName = isGlob(toFind);
-                    if (globName === "_") {
-                        matchResults._.push(curGlob);
-                    } else {
-                        matchResults.vars[globName] = curGlob;
-                    }
-                }
-                curGlob.push(nodeArr[i]);
-            } else if (checkMatchTree(nodeArr[i], toFind, peersToFind, wVars, matchResults, options)) {
-                if (!peersToFind || peersToFind.length === 0) {
-                    return matchResults;
-                    // Found everything needed on this level.
-                } else {
-                    // We matched this node, but we still have more nodes on
-                    // this level we need to match on subsequent iterations
-                    toFind = peersToFind.shift(); // Destructive.
-                }
-            }
-        }
-
-        if (curGlob) {
-            return matchResults;
-        } else if (isGlob(toFind)) {
-            var globName = isGlob(toFind);
-            if (globName === "_") {
-                matchResults._.push([]);
-            } else {
-                matchResults.vars[globName] = [];
-            }
-            return matchResults;
-        }
-
-        return false;
-    }
-
-
-    /*
-     * This discards all wildcard vars that were part of a failed match
-     * this provides an important speedup by stopping anyPossible from having to increment
-     * every match on a doomed set of arguments.
-     * If the any argument set fails no amount of incrementing can save it.
-     */
-    function discardWVarsOnFailureDecorator(callback) {
-        return function(currTree, toFind, peersToFind, wVars, matchResults, options) {
-            var lastWVar;
-            for (lastWVar=0; lastWVar<wVars.order.length; lastWVar++) {
-                var candidate = wVars.values[wVars.order[lastWVar]];
-                if (_.isEmpty(candidate)) {
-                    break;
-                }
-            }
-            var result = callback(currTree, toFind, peersToFind, wVars, matchResults, options);
-            if (!result) {
-                for (; lastWVar<wVars.order.length; lastWVar++) {
-                    var candidate = wVars.values[wVars.order[lastWVar]];
-                    if (!_.isEmpty(candidate)) {
-                        // Reset the wildcard vars' guesses. Delete the properties
-                        // rather than setting to {} in order to maintain shared
-                        // object references in the structure tree (toFind, peers)
-                        _.each(candidate, function(v, k) {
-                            delete candidate[k];
-                        });
-                    } else {
-                        break;
-                    }
-                }
-                wVars._last = lastWVar;
-            }
-            return result;
-        };
-    }
-
-    /*
-     * Returns true if and only if all arguments from the pattern match the corresponding
-     * argument in the test code
-     */
-    var checkArgumentsArray = discardWVarsOnFailureDecorator(function(nodeArr, toFind, peersToFind, wVars, matchResults, options) {
-        var curGlob;
-
-        for (var i = 0; i < nodeArr.length; i += 1) {
-            if (isGlob(toFind)) {
-                if (!curGlob) {
-                    curGlob = [];
-                    var globName = isGlob(toFind);
-                    if (globName === "_") {
-                        matchResults._.push(curGlob);
-                    } else {
-                        matchResults.vars[globName] = curGlob;
-                    }
-                }
-                curGlob.push(nodeArr[i]);
-            } else {
-                if (checkMatchTree(nodeArr[i], toFind, peersToFind, wVars, matchResults, options)) {
-                    if (!peersToFind || peersToFind.length === 0) {
-                        return matchResults;
-                    } else {
-                        toFind = peersToFind.shift();
-                    }
-                } else {
-                    return false;
-                }
-            }
-        }
-
-        if (curGlob) {
-            return matchResults;
-        } else if (isGlob(toFind)) {
-            var globName = isGlob(toFind);
-            if (globName === "_") {
-                matchResults._.push([]);
-            } else {
-                matchResults.vars[globName] = [];
-            }
-            return matchResults;
-        }
-
-        return false;
-    });
-
-    /*
-     * Checks whether the currNode exactly matches the node toFind.
-     *
-     * A match is exact if for every non-null property on toFind, that
-     * property exists on currNode and:
-     *     0. If the property is undefined on toFind, it must exist on currNode.
-     *     1. Otherwise, the values have the same type (ie, they match).
-     *     2. If the values are numbers or strings, they match.
-     *     3. If the values are arrays, checkNodeArray on the arrays returns true.
-     *     4. If the values are objects, checkMatchTree on those objects
-     *         returns true (the objects recursively match to the extent we
-     *         care about, though they may not match exactly).
-     */
-    function exactMatchNode(currNode, toFind, peersToFind, wVars, matchResults, options) {
-        var rootToSet;
-
-        if (!matchResults.root && currNode.type !== "Program") {
-            rootToSet = currNode;
-        }
-
-        for (var key in toFind) {  /* jshint forin:false */
-            // Ignore inherited properties; also, null properties can be
-            // anything and do not have to exist.
-            if (!toFind.hasOwnProperty(key) || toFind[key] === null) {
-                continue;
-            }
-            var subFind = toFind[key];
-            var subCurr = currNode[key];
-            // Undefined properties can be anything, but they must exist.
-            if (subFind === undefined) {
-                /* jshint -W116 */
-                if (subCurr == undefined) {
-                    return false;
-                } else {
-                    matchResults._.push(subCurr);
-                    continue;
-                }
-            }
-            // currNode does not have the key, but toFind does
-            if (subCurr == null) {
-                if (key === "wildcardVar") {
-                    if (wVars.leftToSkip && wVars.leftToSkip[subFind] > 0) {
-                        wVars.leftToSkip[subFind] -= 1;
-                        return false; // Skip, this does not match our wildcard
-                    }
-                    // We have skipped the required number, so take this guess.
-                    // Copy over all of currNode's properties into
-                    //  wVars.values[subFind] so the var references set up in
-                    //  simplifyTree behave like currNode. Shallow copy.
-                    _.extend(wVars.values[subFind], currNode);
-                    matchResults.vars[subFind.slice(1)] = currNode;
-                    if (rootToSet) {
-                        matchResults.root = rootToSet;
-                    }
-                    return matchResults; // This node is now our variable.
-                }
-                return false;
-            }
-            // Now handle arrays/objects/values
-            if (_.isObject(subCurr) !== _.isObject(subFind) ||
-                _.isArray(subCurr) !== _.isArray(subFind) ||
-                (typeof(subCurr) !== typeof(subFind))) {
-                return false;
-            } else if (_.isArray(subCurr)) {
-                // Both are arrays, do a recursive compare.
-                // (Arrays are objects so do this check before the object check)
-                if (subFind.length === 0) {
-                    continue; // Empty arrays can match any array.
-                }
-                var newToFind = subFind[0];
-                var peers = subFind.slice(1);
-                if (key === "params" || key === "arguments") {
-                    if (!checkArgumentsArray(subCurr, newToFind, peers, wVars, matchResults, options)) {
-                        return false;
-                    }
-                } else if (!checkNodeArray(subCurr, newToFind, peers, wVars, matchResults, options)) {
-                    return false;
-                }
-            } else if (_.isObject(subCurr)) {
-                // Both are objects, so do a recursive compare.
-                if (!checkMatchTree(subCurr, subFind, peersToFind, wVars, matchResults, options)) {
-                    return false;
-                }
-            } else {
-                // Check that the non-object (number/string) values match
-                if (subCurr !== subFind) {
-                    return false;
-                }
-            }
-        }
-        if (toFind === undefined) {
-            matchResults._.push(currNode);
-        }
-        if (rootToSet) {
-            matchResults.root = rootToSet;
-        }
-        return matchResults;
-    }
-
-    function deepClone(obj) {
-        return JSON.parse(JSON.stringify(obj));
     }
 
     /*
@@ -1009,7 +1218,7 @@
             return node;
         }
 
-        for (var prop in node) {  /* jshint forin:false */
+        for (var prop in node) { /* jshint forin:false */
             if (!node.hasOwnProperty(prop)) {
                 continue;
             }
@@ -1019,8 +1228,7 @@
                     var globData = getGlobData(node[prop][i], data);
 
                     if (globData) {
-                        node[prop].splice.apply(node[prop],
-                            [i, 1].concat(globData));
+                        node[prop].splice.apply(node[prop], [i, 1].concat(globData));
                         break;
                     } else if (typeof node[prop][i] === "object") {
                         var singleData = getSingleData(node[prop][i], data);
@@ -1046,7 +1254,21 @@
         return node;
     }
 
-    exports.match = match;
+    function _match(code, rawStructure, options) {
+        var result = match(code, rawStructure, options);
+
+        if (result.matched) {
+            return result;
+        }
+
+        if (result.failure) {
+            options.varCallbacks.failure = result.failure;
+        }
+
+        return false;
+    }
+
+    exports.match = _match;
     exports.matchNode = function(code, rawStructure, options) {
         options = options || {};
         options.single = true;
@@ -1058,4 +1280,7 @@
         return injectData(node, data);
     };
     exports.prettify = prettyHtml;
+
+
+
 })(typeof window !== "undefined" ? window : global);
